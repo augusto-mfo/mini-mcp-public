@@ -32,12 +32,12 @@
         // to a real remote MCP server later.
         // ---------------------------------------------------------------
         const USERS = [
-            { id: 1, name: "Alice", age: 25 },
-            { id: 2, name: "Bob", age: 34 },
-            { id: 3, name: "Charlie", age: 22 },
-            { id: 4, name: "David", age: 45 },
-            { id: 5, name: "Emma", age: 29 }
-        ];
+			{ id: 1, name: "Alice", birthDate: "2001-05-14" },
+			{ id: 2, name: "Bob", birthDate: "1992-09-23" },
+			{ id: 3, name: "Charlie", birthDate: "2004-02-11" },
+			{ id: 4, name: "David", birthDate: "1981-11-30" },
+			{ id: 5, name: "Emma", birthDate: "1997-07-08" }
+		];
 
         const mcpServer = {
             info: { name: "static-mcp-llm", version: "1.0.0" },
@@ -50,7 +50,7 @@
                 },
                 {
                     name: "get_user",
-                    description: "Returns ONE user (id, name, age) looked up by name. Use only when the question names a specific person.",
+                    description: "Returns ONE user (id, name, birthDate) looked up by name. Use only when the question names a specific person.",
                     inputSchema: {
                         type: "object",
                         properties: { name: { type: "string", description: "User name, e.g. Alice" } },
@@ -58,25 +58,37 @@
                     },
                     run: async ({ name }) =>
                         USERS.find(u => u.name.toLowerCase() === String(name).toLowerCase()) || { error: "User not found" }
-                },
-                {
+                }                {
                     name: "get_youngest_user",
-                    description: "Returns the single youngest user (id, name, age).",
+                    description: "Returns the single youngest user (id, name, birthDate).",
                     inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => USERS.reduce((a, b) => (b.age < a.age ? b : a))
+                    run: async () => USERS.reduce((a, b) => (new Date(b.birthDate) > new Date(a.birthDate) ? b : a))
                 },
                 {
                     name: "get_oldest_user",
-                    description: "Returns the single oldest user (id, name, age).",
+                    description: "Returns the single oldest user (id, name, birthDate).",
                     inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => USERS.reduce((a, b) => (b.age > a.age ? b : a))
+                    run: async () => USERS.reduce((a, b) => (new Date(b.birthDate) < new Date(a.birthDate) ? b : a))
                 },
                 {
                     name: "get_average_age",
-                    description: "Returns the average age of all users.",
+                    description: "Returns the average age of all users based on their birthDate.",
                     inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => ({ average_age: USERS.reduce((sum, u) => sum + u.age, 0) / USERS.length })
+                    run: async () => {
+                        const now = new Date();
+                        const totalAge = USERS.reduce((sum, u) => {
+                            const birth = new Date(u.birthDate);
+                            let age = now.getFullYear() - birth.getFullYear();
+                            const m = now.getMonth() - birth.getMonth();
+                            if (m < 0 || (m === 0 && now.getDate() < birth.getDate())) {
+                                age--;
+                            }
+                            return sum + age;
+                        }, 0);
+                        return { average_age: totalAge / USERS.length };
+                    }
                 }
+
             ],
             async handle({ id, method, params }) {
                 if (method === "initialize") {
