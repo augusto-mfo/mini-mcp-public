@@ -58,7 +58,8 @@
                     },
                     run: async ({ name }) =>
                         USERS.find(u => u.name.toLowerCase() === String(name).toLowerCase()) || { error: "User not found" }
-                }                {
+                },
+                {
                     name: "get_youngest_user",
                     description: "Returns the single youngest user (id, name, birthDate).",
                     inputSchema: { type: "object", properties: {}, required: [] },
@@ -88,7 +89,6 @@
                         return { average_age: totalAge / USERS.length };
                     }
                 }
-
             ],
             async handle({ id, method, params }) {
                 if (method === "initialize") {
