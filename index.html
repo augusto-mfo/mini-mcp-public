@@ -20,9 +20,10 @@
         let engine = null;
 
         const modelCandidates = [
+            "Qwen2.5-3B-Instruct-q4f32_1-MLC",
+            "Qwen2.5-3B-Instruct-q4f16_1-MLC",
             "Qwen2.5-1.5B-Instruct-q4f32_1-MLC",
-            "Qwen2.5-1.5B-Instruct-q4f16_1-MLC",
-            "Qwen2.5-3B-Instruct-q4f32_1-MLC"
+            "Qwen2.5-1.5B-Instruct-q4f16_1-MLC"
         ];
 
         // ---------------------------------------------------------------
@@ -49,7 +50,7 @@
                 },
                 {
                     name: "get_user",
-                    description: "Returns one user (id, name, age) looked up by name.",
+                    description: "Returns ONE user (id, name, age) looked up by name. Use only when the question names a specific person.",
                     inputSchema: {
                         type: "object",
                         properties: { name: { type: "string", description: "User name, e.g. Alice" } },
@@ -57,6 +58,24 @@
                     },
                     run: async ({ name }) =>
                         USERS.find(u => u.name.toLowerCase() === String(name).toLowerCase()) || { error: "User not found" }
+                },
+                {
+                    name: "get_youngest_user",
+                    description: "Returns the single youngest user (id, name, age).",
+                    inputSchema: { type: "object", properties: {}, required: [] },
+                    run: async () => USERS.reduce((a, b) => (b.age < a.age ? b : a))
+                },
+                {
+                    name: "get_oldest_user",
+                    description: "Returns the single oldest user (id, name, age).",
+                    inputSchema: { type: "object", properties: {}, required: [] },
+                    run: async () => USERS.reduce((a, b) => (b.age > a.age ? b : a))
+                },
+                {
+                    name: "get_average_age",
+                    description: "Returns the average age of all users.",
+                    inputSchema: { type: "object", properties: {}, required: [] },
+                    run: async () => ({ average_age: USERS.reduce((sum, u) => sum + u.age, 0) / USERS.length })
                 }
             ],
             async handle({ id, method, params }) {
@@ -119,8 +138,9 @@
                 "Reply with ONLY one JSON object and no other text. Format: {\"tool\": \"<name>\", \"arguments\": {...}}\n\n" +
                 "Examples:\n" +
                 "Question: list all users\n{\"tool\": \"list_users\", \"arguments\": {}}\n" +
-                "Question: who is the youngest user?\n{\"tool\": \"list_users\", \"arguments\": {}}\n" +
-                "Question: what is the average age?\n{\"tool\": \"list_users\", \"arguments\": {}}\n" +
+                "Question: who is the youngest user?\n{\"tool\": \"get_youngest_user\", \"arguments\": {}}\n" +
+                "Question: what is the average age?\n{\"tool\": \"get_average_age\", \"arguments\": {}}\n" +
+                "Question: who is the oldest user?\n{\"tool\": \"get_oldest_user\", \"arguments\": {}}\n" +
                 "Question: how old is Bob?\n{\"tool\": \"get_user\", \"arguments\": {\"name\": \"Bob\"}}\n" +
                 "Question: hello\n{\"tool\": \"none\", \"arguments\": {}}\n" +
                 "Question: write me a poem\n{\"tool\": \"none\", \"arguments\": {}}"
@@ -137,6 +157,19 @@
                     return { name: obj.tool, arguments: obj.arguments || {} };
                 }
             } catch (_) { /* invalid JSON */ }
+            return null;
+        }
+
+        function validateArgs(call) {
+            const tool = mcpTools.find(t => t.name === call.name);
+            const props = tool.inputSchema.properties || {};
+            for (const key of tool.inputSchema.required || []) {
+                const v = call.arguments[key];
+                const type = props[key] && props[key].type;
+                if (v === null || v === undefined || v === "" || (type === "string" && typeof v !== "string")) {
+                    return `Argument "${key}" is required and must be a ${type || "value"}.`;
+                }
+            }
             return null;
         }
 
@@ -205,18 +238,33 @@
             trace("\n=== QUESTION ===", question);
 
             try {
-                // Phase 1: the model only decides which tool to call (or "none")
-                const decision = await engine.chat.completions.create({
-                    messages: [
-                        { role: "system", content: buildSystemPrompt() },
-                        { role: "user", content: "Question: " + question }
-                    ],
-                    temperature: 0,
-                    max_tokens: 80
-                });
-                const decisionText = decision.choices[0].message.content.trim();
-                trace("LLM (decide)", decisionText);
-                const call = parseToolCall(decisionText);
+                // Phase 1: the model only decides which tool to call (or "none"); invalid calls get one retry
+                const decideMessages = [
+                    { role: "system", content: buildSystemPrompt() },
+                    { role: "user", content: "Question: " + question }
+                ];
+                let call = null;
+                for (let attempt = 0; attempt < 2; attempt++) {
+                    const decision = await engine.chat.completions.create({
+                        messages: decideMessages, temperature: 0, max_tokens: 80
+                    });
+                    const decisionText = decision.choices[0].message.content.trim();
+                    trace(attempt ? "LLM (decide, retry)" : "LLM (decide)", decisionText);
+
+                    call = parseToolCall(decisionText);
+                    const problem = !call
+                        ? "The reply was not a valid JSON tool call."
+                        : (call.none ? null : validateArgs(call));
+                    if (!problem) break;
+
+                    trace("HOST validation", problem);
+                    decideMessages.push({ role: "assistant", content: decisionText });
+                    decideMessages.push({
+                        role: "user",
+                        content: `That call was invalid: ${problem} Reply again with ONLY the JSON object. Re-read the tool descriptions and pick the tool that matches the question.`
+                    });
+                    call = null;
+                }
 
                 let finalAnswer;
                 if (!call) {
@@ -268,7 +316,7 @@
     <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
 
     <div>
-        <input type="text" id="user-input" placeholder="e.g., How old is Alice? / Who is the oldest user?">
+        <input type="text" id="user-input" placeholder="e.g., How old is Alice? / Who is the youngest user? / Average age?">
         <button id="chat-btn" onclick="window.sendPrompt()" disabled>Send</button>
     </div>
 
