@@ -144,7 +144,8 @@
             ).join("\n");
 
             return (
-				"The current date is " + new Date().toISOString().split('T')[0] + "\n" +
+				"The current date is " + new Date().toISOString().split('T')[0] + ".\n" +
+				"When calculating a user's age, remember to compare the current month/day with their birth month/day to see if they have already had their birthday this year.\n" +
                 "You decide which tool to use for questions about a user database. You have NO user data yourself.\n\n" +
                 "Available tools:\n" + toolDocs + "\n" +
                 "- none: use when the question is NOT about the users (greetings, coding, general knowledge).\n\n" +
