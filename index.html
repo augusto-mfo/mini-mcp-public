@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MCP + LLM 100% no Navegador</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; line-height: 1.6; }
+        button { padding: 10px 15px; border: none; border-radius: 5px; background: #0070f3; color: white; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        input[type="text"] { width: 70%; padding: 10px; border: 1px solid #ccc; border-radius: 5px; margin-right: 10px; }
+        .box { background: #f4f4f4; padding: 15px; border-radius: 5px; min-height: 50px; border-left: 5px solid #0070f3; margin-top: 10px; white-space: pre-wrap; }
+        #status { font-weight: bold; color: #d4af37; }
+    </style>
+
+    <!-- Script principal definido como modulo -->
+    <script type="module">
+        import { Server } from "https://esm.sh";
+        import * as webllm from "https://esm.sh";
+
+        let engine = null;
+        
+        // Modelo ultraleve (SmolLM2-135M) - Download de apenas alguns megabytes
+        const selectedModel = "SmolLM2-135M-Instruct-q4f16_1-MLC"; 
+
+        // 1. Inicializa o Servidor MCP no lado do Cliente
+        const mcpServer = new Server({
+            name: "mcp-llm-estatico",
+            version: "1.0.0"
+        }, {
+            capabilities: { tools: {} }
+        });
+
+        // Adiciona uma ferramenta local de teste ao MCP
+        mcpServer.tool("obter_metadados", "Retorna informações sobre o ambiente e página", {}, async () => {
+            return {
+                content: [{ 
+                    type: "text", 
+                    text: `Url Atual: ${window.location.href}. Agente do Navegador: ${navigator.userAgent}` 
+                }]
+            };
+        });
+
+        // 2. Função para Carregar o LLM via WebGPU
+        async function initLLM() {
+            const statusEl = document.getElementById("status");
+            statusEl.innerText = "Verificando compatibilidade e iniciando download...";
+            
+            try {
+                engine = await webllm.CreateEngine(selectedModel, {
+                    initProgressCallback: (report) => {
+                        statusEl.innerText = report.text;
+                    }
+                });
+                
+                statusEl.innerText = "Modelo pronto e carregado na WebGPU com sucesso!";
+                statusEl.style.color = "green";
+                document.getElementById("chat-btn").disabled = false;
+            } catch (error) {
+                console.error(error);
+                statusEl.innerText = "Erro ao carregar o modelo. Certifique-se de que seu navegador suporta WebGPU e a aceleração de hardware está ativa.";
+                statusEl.style.color = "red";
+            }
+        }
+
+        // 3. Função para processar o Chat
+        async function enviarPergunta() {
+            const inputVal = document.getElementById("user-input").value;
+            const respostaEl = document.getElementById("resposta");
+            
+            if (!inputVal || !engine) return;
+
+            respostaEl.innerText = "O modelo está pensando...";
+
+            try {
+                const messages = [{ role: "user", content: inputVal }];
+                const reply = await engine.chat.completions.create({ messages });
+                
+                respostaEl.innerText = reply.choices[0].message.content;
+            } catch (error) {
+                console.error(error);
+                respostaEl.innerText = "Erro ao gerar resposta do modelo.";
+            }
+        }
+
+        // CORREÇÃO CRUCIAL: Expõe as funções para o escopo global (window)
+        // Isso resolve o erro "initLLM is not defined" ao clicar nos botões do HTML
+        window.initLLM = initLLM;
+        window.enviarPergunta = enviarPergunta;
+        
+        console.log("Servidor MCP e controladores de IA carregados no escopo do módulo.");
+    </script>
+</head>
+<body>
+
+    <h1>MCP + LLM 100% no Navegador</h1>
+    <p>Status atual: <span id="status">Aguardando comando do usuário...</span></p>
+    
+    <button onclick="window.initLLM()">Carregar Modelo Local (Requer WebGPU)</button>
+    
+    <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
+    
+    <div>
+        <input type="text" id="user-input" placeholder="Digite uma instrução para o modelo local...">
+        <button id="chat-btn" onclick="window.enviarPergunta()" disabled>Enviar</button>
+    </div>
+    
+    <h3>Resposta do Modelo:</h3>
+    <div id="resposta" class="box">O modelo aparecerá aqui após o carregamento e envio da pergunta.</div>
+
+</body>
+</html>
