@@ -15,14 +15,10 @@
     </style>
 
     <script type="module">
-        // Import the AI engine using a reliable, browser-focused CDN bundle path
-        import * as webllm from "https://jsdelivr.net";
-
         let engine = null;
-        // SmolLM2-135M is a super lightweight model perfect for quick loading in a static environment
         const selectedModel = "SmolLM2-135M-Instruct-q4f16_1-MLC"; 
 
-        // Simulated local MCP server architecture structured for the front-end
+        // Simulated local MCP server architecture
         const miniMcpServer = {
             name: "static-mcp-llm",
             version: "1.0.0",
@@ -34,14 +30,18 @@
             }
         };
 
-        // Initialize the local LLM using WebGPU hardware acceleration
-        async function initLLM() {
+        // BIND FUNCTIONS IMMEDIATELY so the buttons never throw "is not a function"
+        window.initLLM = async function() {
             const statusEl = document.getElementById("status");
-            statusEl.innerText = "Downloading and initializing lightweight model (SmolLM)...";
+            statusEl.innerText = "Connecting to CDN and loading library...";
             statusEl.style.color = "#d4af37";
             
             try {
-                // Instantiates the model right inside the user's browser sandbox
+                // Dynamic import: if this fails, it won't crash the entire page script
+                const webllm = await import("https://jsdelivr.net");
+                
+                statusEl.innerText = "Downloading lightweight model (SmolLM)...";
+                
                 engine = await webllm.CreateEngine(selectedModel, {
                     initProgressCallback: (report) => {
                         statusEl.innerText = report.text;
@@ -53,13 +53,12 @@
                 document.getElementById("chat-btn").disabled = false;
             } catch (error) {
                 console.error(error);
-                statusEl.innerText = "Failed to load the model. Please verify your browser supports WebGPU (updated Chrome/Edge) and hardware acceleration is enabled.";
+                statusEl.innerText = "Network Error: Could not fetch the AI libraries from the CDN. Please check your internet connection or try again.";
                 statusEl.style.color = "red";
             }
-        }
+        };
 
-        // Process user prompt and handle local MCP tool context injection
-        async function sendPrompt() {
+        window.sendPrompt = async function() {
             const inputVal = document.getElementById("user-input").value;
             const responseEl = document.getElementById("resposta");
             if (!inputVal || !engine) return;
@@ -67,7 +66,6 @@
             responseEl.innerText = "The local model is thinking...";
 
             try {
-                // Simulates pulling data dynamically through the local MCP toolset
                 const mcpData = await miniMcpServer.tools["get_metadata"].execute();
                 const contextualizedPrompt = `System Context (via Local MCP Server):\n${mcpData}\n\nUser Instruction: ${inputVal}`;
 
@@ -77,15 +75,11 @@
                 responseEl.innerText = reply.choices.message.content;
             } catch (error) {
                 console.error(error);
-                responseEl.innerText = "An error occurred while processing the response from the local AI model.";
+                responseEl.innerText = "An error occurred while processing the AI response.";
             }
-        }
-
-        // Bind internal functions to the global window object to allow standard HTML button execution
-        window.initLLM = initLLM;
-        window.sendPrompt = sendPrompt;
+        };
         
-        console.log("Modules successfully bound to global scope.");
+        console.log("Buttons safely bound to window scope.");
     </script>
 </head>
 <body>
