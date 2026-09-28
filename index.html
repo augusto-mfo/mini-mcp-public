@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
     <title>MCP + LLM 100% in Browser</title>
     <style>
         body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; line-height: 1.6; background: #fafafa; color: #333; }
@@ -16,7 +17,13 @@
 
     <script type="module">
         let engine = null;
-        const selectedModel = "SmolLM2-135M-Instruct-q4f16_1-MLC"; 
+
+        // Preferred model. If it is not in WebLLM's prebuilt list, we fall back automatically.
+        const preferredModel = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+        const fallbackModels = [
+            "SmolLM2-135M-Instruct-q0f16-MLC",
+            "Llama-3.2-1B-Instruct-q4f16_1-MLC"
+        ];
 
         // Simulated local MCP server architecture
         const miniMcpServer = {
@@ -30,73 +37,112 @@
             }
         };
 
-        // BIND FUNCTIONS IMMEDIATELY so the buttons never throw "is not a function"
-        window.initLLM = async function() {
+        window.initLLM = async function () {
             const statusEl = document.getElementById("status");
+            const loadBtn = document.getElementById("load-btn");
+
+            if (!navigator.gpu) {
+                statusEl.innerText = "WebGPU is not available in this browser. In Brave, enable brave://flags/#enable-unsafe-webgpu and restart.";
+                statusEl.style.color = "red";
+                return;
+            }
+
+            loadBtn.disabled = true;
             statusEl.innerText = "Connecting to CDN and loading library...";
             statusEl.style.color = "#d4af37";
-            
+
+            let webllm;
             try {
-                // Dynamic import: if this fails, it won't crash the entire page script
-                const webllm = await import("https://jsdelivr.net");
-                
-                statusEl.innerText = "Downloading lightweight model (SmolLM)...";
-                
-                engine = await webllm.CreateEngine(selectedModel, {
+                webllm = await import("https://esm.run/@mlc-ai/web-llm");
+            } catch (error) {
+                console.error(error);
+                statusEl.innerText = "Network Error: Could not fetch the WebLLM library from the CDN. Check your connection and try again.";
+                statusEl.style.color = "red";
+                loadBtn.disabled = false;
+                return;
+            }
+
+            try {
+                const available = webllm.prebuiltAppConfig.model_list.map(m => m.model_id);
+                console.log("Available models:", available);
+
+                const modelId = [preferredModel, ...fallbackModels].find(id => available.includes(id));
+                if (!modelId) {
+                    throw new Error("None of the configured models exist in this WebLLM version. See console for the available list.");
+                }
+
+                statusEl.innerText = `Downloading model ${modelId}...`;
+
+                engine = await webllm.CreateMLCEngine(modelId, {
                     initProgressCallback: (report) => {
                         statusEl.innerText = report.text;
                     }
                 });
-                
-                statusEl.innerText = "Model ready and successfully loaded into WebGPU!";
+
+                statusEl.innerText = `Model ${modelId} ready and loaded into WebGPU!`;
                 statusEl.style.color = "green";
                 document.getElementById("chat-btn").disabled = false;
             } catch (error) {
                 console.error(error);
-                statusEl.innerText = "Network Error: Could not fetch the AI libraries from the CDN. Please check your internet connection or try again.";
+                statusEl.innerText = "Model error: " + error.message;
                 statusEl.style.color = "red";
+                loadBtn.disabled = false;
             }
         };
 
-        window.sendPrompt = async function() {
-            const inputVal = document.getElementById("user-input").value;
+        window.sendPrompt = async function () {
+            const inputEl = document.getElementById("user-input");
+            const chatBtn = document.getElementById("chat-btn");
             const responseEl = document.getElementById("resposta");
+            const inputVal = inputEl.value.trim();
             if (!inputVal || !engine) return;
 
+            chatBtn.disabled = true;
             responseEl.innerText = "The local model is thinking...";
 
             try {
                 const mcpData = await miniMcpServer.tools["get_metadata"].execute();
-                const contextualizedPrompt = `System Context (via Local MCP Server):\n${mcpData}\n\nUser Instruction: ${inputVal}`;
 
-                const messages = [{ role: "user", content: contextualizedPrompt }];
+                const messages = [
+                    {
+                        role: "system",
+                        content: `You are a helpful assistant. Context provided by a local MCP tool (get_metadata):\n${mcpData}`
+                    },
+                    { role: "user", content: inputVal }
+                ];
+
                 const reply = await engine.chat.completions.create({ messages });
-                
-                responseEl.innerText = reply.choices.message.content;
+                responseEl.innerText = reply.choices[0].message.content;
             } catch (error) {
                 console.error(error);
-                responseEl.innerText = "An error occurred while processing the AI response.";
+                responseEl.innerText = "An error occurred while processing the AI response: " + error.message;
+            } finally {
+                chatBtn.disabled = false;
             }
         };
-        
+
+        document.getElementById("user-input").addEventListener("keydown", (e) => {
+            if (e.key === "Enter") window.sendPrompt();
+        });
+
         console.log("Buttons safely bound to window scope.");
     </script>
 </head>
 <body>
 
     <h1>MCP + LLM 100% in Browser</h1>
-    
+
     <p>Current Status: <span id="status">Waiting for user command...</span></p>
-    
-    <button onclick="window.initLLM()">Load Local Model (Requires WebGPU)</button>
-    
+
+    <button id="load-btn" onclick="window.initLLM()">Load Local Model (Requires WebGPU)</button>
+
     <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
-    
+
     <div>
         <input type="text" id="user-input" placeholder="Ask something to the local model...">
         <button id="chat-btn" onclick="window.sendPrompt()" disabled>Send</button>
     </div>
-    
+
     <h3>Model Response:</h3>
     <div id="resposta" class="box">The output will appear here after loading the model and submitting a prompt.</div>
 
