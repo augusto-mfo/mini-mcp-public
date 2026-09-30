@@ -120,19 +120,12 @@ server.registerTool("list_users",
   async () => reply(USERS));
 
 server.registerTool("get_user",
-  { description: "Return one user looked up by name.", inputSchema: { name: z.string().describe("User name, e.g. Alice") } },
+  { description: "Return the age of a user looked up by name.", inputSchema: { name: z.string().describe("User name, e.g. Alice") } },
   async ({ name }) => reply(USERS.find(u => u.name.toLowerCase() === name.toLowerCase()) ?? { error: "User not found" }));
 
 server.registerTool("add_user",
   { description: "Add a new user.", inputSchema: { name: z.string(), age: z.number().describe("Age in years") } },
   async ({ name, age }) => { const u = { id: USERS.length + 1, name, age }; USERS.push(u); renderTable([u.id]); return reply(u); });
-
-server.registerTool("calculate",
-  { description: "Evaluate an arithmetic expression exactly. Use it for any math.", inputSchema: { expression: z.string().describe("e.g. (25+34)/2 or 2026-45") } },
-  async ({ expression }) => {
-    if (!/^[\d+\-*/().%\s]+$/.test(expression)) return reply({ error: "Only numbers and + - * / % ( ) are allowed" });
-    return reply({ result: Function(`"use strict";return (${expression})`)() });
-  });
 
 // ------------------------------------------------------------------
 // 2. MCP CLIENT: official Client over an in-memory transport.
