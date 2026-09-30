@@ -116,16 +116,43 @@ const reply = data => ({ content: [{ type: "text", text: JSON.stringify(data) }]
 const server = new McpServer({ name: "users-demo", version: "1.0.0" });
 
 server.registerTool("list_users",
-  { description: "Return all users (id, name, age)." },
+  { 
+    description: "Return a complete list of all registered users including their id, name, and age. Use this when you need to scan everyone.",
+    inputSchema: { type: "object", properties: {} } 
+  },
   async () => reply(USERS));
 
 server.registerTool("get_user",
-  { description: "Return the age of a user looked up by name.", inputSchema: { name: z.string().describe("User name, e.g. Alice") } },
+  { 
+    description: "Return the id, name, and age of a specific user by looking up their exact name. Use this instead of listing all users if you already know the target name.", 
+    inputSchema: { 
+      type: "object", 
+      properties: {
+        name: { type: "string", description: "The exact name of the user to look up." }
+      },
+      required: ["name"]
+    } 
+  },
   async ({ name }) => reply(USERS.find(u => u.name.toLowerCase() === name.toLowerCase()) ?? { error: "User not found" }));
 
 server.registerTool("add_user",
-  { description: "Add a new user.", inputSchema: { name: z.string(), age: z.number().describe("Age in years") } },
-  async ({ name, age }) => { const u = { id: USERS.length + 1, name, age }; USERS.push(u); renderTable([u.id]); return reply(u); });
+  { 
+    description: "Create and register a new user into the system with a unique incremental ID.", 
+    inputSchema: { 
+      type: "object", 
+      properties: {
+        name: { type: "string", description: "The name of the new user." },
+        age: { type: "number", description: "The age of the user in years." }
+      },
+      required: ["name", "age"]
+    } 
+  },
+  async ({ name, age }) => { 
+    const u = { id: USERS.length + 1, name, age }; 
+    USERS.push(u); 
+    renderTable([u.id]); 
+    return reply(u); 
+  });
 
 // ------------------------------------------------------------------
 // 2. MCP CLIENT: official Client over an in-memory transport.
@@ -170,20 +197,35 @@ async function connectMcp() {
 // 3. HOST: generic prompt built only from what the server advertises.
 // ------------------------------------------------------------------
 function systemPrompt() {
-  const docs = mcpTools.map(t => `- ${t.name}: ${t.description ?? ""} Arguments: ${JSON.stringify(t.inputSchema.properties ?? {})}`).join("\n");
-  return `You are a helpful assistant running locally in a browser. You have no data of your own: use tools to look up facts and to do calculations. Never do arithmetic yourself if a calculator tool exists.
-Today's date: ${new Date().toDateString()}.
+  const docs = mcpTools.map(t => {
+    const props = t.inputSchema?.properties ? JSON.stringify(t.inputSchema.properties) : "None";
+    return `- ${t.name}: ${t.description}\n  Arguments schema: ${props}`;
+  }).join("\n");
 
-Tools:
-${docs}
+  return `You are a strict local AI Agent operating inside a JSON-RPC interface. You have no internal knowledge; you must rely entirely on tools to query data.
 
-Always reply with ONLY one JSON object.
-To call a tool: {"tool": "<tool name>", "arguments": {...}}
-To answer the user: {"tool": "final_answer", "arguments": {}, "answer": "<short plain-language answer>"}
-You can call tools one after another. Answer as soon as you have what you need.
-Use the conversation so far to resolve references such as "he", "she" or "that one".
-If the answer is not directly available, derive it from tool results (fetch the data, then calculate). Only say the information is unavailable after trying the relevant tools.
-If a lookup returns an error or "not found", do not guess: tell the user.`;
+	### AVAILABLE TOOLS
+	${docs}
+
+	### OUTPUT FORMAT RULES
+	You must respond with EXACTLY one valid JSON object. Do not include any introductory or concluding text outside the JSON block.
+
+	To call a dynamic tool, use this structure:
+	{"tool": "tool_name", "arguments": {"param_name": "value"}}
+
+	To output your final conclusion to the user, use this structure:
+	{"tool": "final_answer", "arguments": {}, "answer": "Your plain-language response here."}
+
+	### EXAMPLES
+	User: "Is Alice in the database?"
+	Assistant: {"tool": "get_user", "arguments": {"name": "Alice"}}
+
+	User: "Add Bob who is 30 years old"
+	Assistant: {"tool": "add_user", "arguments": {"name": "Bob", "age": 30}}
+
+	### STRATEGY
+	1. Analyze the user request. If a specific lookup tool exists (like get_user), prefer it over a generic bulk list tool.
+	2. If a tool returns an error or a user is not found, map that into your final_answer JSON. Do not hallucinate or make assumptions.`;
 }
 
 function parseCall(text) {
