@@ -19,7 +19,7 @@ h1 span{color:var(--acc)}
 .pill{font:12px var(--mono);color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:2px 10px}
 .loader{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 select,input,button{font:inherit;color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
-select{max-width:340px}
+select{width:min(460px,100%)}
 button{background:var(--acc);color:#04211d;border:0;font-weight:700;cursor:pointer}
 button:hover{filter:brightness(1.1)}button:disabled,select:disabled{opacity:.4;cursor:not-allowed}
 #bar{height:3px;background:var(--line);border-radius:3px;overflow:hidden}
@@ -187,7 +187,10 @@ ${docs}
 Always reply with ONLY one JSON object.
 To call a tool: {"tool": "<tool name>", "arguments": {...}}
 To answer the user: {"tool": "final_answer", "arguments": {}, "answer": "<short plain-language answer>"}
-You can call tools one after another. Answer as soon as you have what you need. If no tool is relevant, answer directly.`;
+You can call tools one after another. Answer as soon as you have what you need.
+Use the conversation so far to resolve references such as "he", "she" or "that one".
+If the answer is not directly available, derive it from tool results (fetch the data, then calculate). Only say the information is unavailable after trying the relevant tools.
+If a lookup returns an error or "not found", do not guess: tell the user.`;
 }
 
 function parseCall(text) {
@@ -224,6 +227,7 @@ function add(cls, text) {
 }
 
 let engine, webllm;
+const history = [];   // previous questions and final answers, so follow-ups work
 
 async function init() {
   try {
@@ -241,7 +245,7 @@ async function init() {
 
 $("load").onclick = async () => {
   const id = $("model").value;
-  $("model").disabled = $("load").disabled = true; setBadge("busy", "loading model");
+  $("model").disabled = $("load").disabled = true; setBadge("busy", "loading model"); history.length = 0;
   try {
     await engine?.unload?.();
     engine = await webllm.CreateMLCEngine(id, {
@@ -303,7 +307,7 @@ $("form").onsubmit = async ev => {
   $("q").value = ""; $("q").disabled = $("send").disabled = true;
   add("msg user", q);
 
-  const messages = [{ role: "system", content: systemPrompt() }, { role: "user", content: q }];
+  const messages = [{ role: "system", content: systemPrompt() }, ...history, { role: "user", content: q }];
   let final = null, invalid = 0, step = 0, phase = "starting";
   const stop = startTimer(() => phase);
   try {
@@ -340,7 +344,11 @@ $("form").onsubmit = async ev => {
       messages.push({ role: "user", content: `Tool result (${call.name}):\n${out}\n\nIf you now have enough information, reply with final_answer. Otherwise call another tool.` });
     }
     const secs = stop();
-    if (final) { add("msg bot", final); add("meta", `done · ${step} step${step > 1 ? "s" : ""} · ${secs.toFixed(1)}s`); setBadge("done", `done · ${secs.toFixed(1)}s`); }
+    if (final) {
+      history.push({ role: "user", content: q },
+        { role: "assistant", content: JSON.stringify({ tool: "final_answer", arguments: {}, answer: final }) });
+      history.splice(0, Math.max(0, history.length - 12));   // keep the last 6 turns to protect the context window
+      add("msg bot", final); add("meta", `done · ${step} step${step > 1 ? "s" : ""} · ${secs.toFixed(1)}s`); setBadge("done", `done · ${secs.toFixed(1)}s`); }
     else { add("msg bot", "I couldn't reach an answer. Try rephrasing, or pick a larger model."); setBadge("fail", "no answer"); }
   } catch (e) { stop(); add("chip err", "Error: " + e.message); setBadge("fail", "error"); console.error(e); }
   $("q").disabled = $("send").disabled = false; $("q").focus();
