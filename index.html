@@ -42,6 +42,13 @@ form input{flex:1}
 table{width:100%;border-collapse:collapse;font:13px var(--mono)}
 th,td{text-align:left;padding:7px 14px;border-bottom:1px solid var(--line)}
 th{color:var(--dim);font-weight:400}
+.badge{font:12px var(--mono);border-radius:99px;padding:2px 10px;border:1px solid var(--line);color:var(--dim)}
+.badge.busy{color:var(--warn);border-color:#5c4a12}.badge.done{color:var(--ok);border-color:#1f5c37}.badge.fail{color:var(--bad);border-color:#5c2929}
+.badge.busy::before{content:"";display:inline-block;width:7px;height:7px;margin-right:7px;border-radius:50%;background:var(--warn);animation:pulse 1s infinite}
+@keyframes pulse{50%{opacity:.2}}
+.live{align-self:flex-start;background:transparent;border:1px dashed var(--line);color:var(--dim);font:12px var(--mono);width:88%}
+.live b{display:block;color:var(--warn);font-weight:600;margin-bottom:2px}
+.meta{align-self:flex-start;font:11px var(--mono);color:var(--dim);margin-top:-4px}
 tr.hit td{animation:hit 1.6s ease-out}
 @keyframes hit{0%,30%{background:#134e4a}100%{background:transparent}}
 #trace{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
@@ -56,6 +63,7 @@ pre{margin:0;padding:8px 12px 10px;font:12px/1.5 var(--mono);overflow:auto;borde
 <body>
 <header>
   <div><h1>MCP <span>+</span> LLM <span class="pill">100% in the browser</span></h1></div>
+  <span id="badge" class="badge">idle</span>
   <div class="loader">
     <select id="model" disabled><option>Loading model list…</option></select>
     <button id="load" disabled>Load model</button>
@@ -176,14 +184,16 @@ Today's date: ${new Date().toDateString()}.
 Tools:
 ${docs}
 
-To call a tool, reply with ONLY a JSON object: {"tool": "<tool name>", "arguments": {...}}
-You can call tools one after another. Once you have what you need, reply with a short plain-language answer (no JSON). If no tool is relevant, just answer normally.`;
+Always reply with ONLY one JSON object.
+To call a tool: {"tool": "<tool name>", "arguments": {...}}
+To answer the user: {"tool": "final_answer", "arguments": {}, "answer": "<short plain-language answer>"}
+You can call tools one after another. Answer as soon as you have what you need. If no tool is relevant, answer directly.`;
 }
 
 function parseCall(text) {
   const m = text.match(/\{[\s\S]*\}/);
   if (!m) return null;
-  try { const o = JSON.parse(m[0]); return typeof o.tool === "string" ? { name: o.tool, arguments: o.arguments ?? {} } : null; } catch { return null; }
+  try { const o = JSON.parse(m[0]); return typeof o.tool === "string" ? o : null; } catch { return null; }
 }
 
 function validate(call) {
@@ -231,7 +241,7 @@ async function init() {
 
 $("load").onclick = async () => {
   const id = $("model").value;
-  $("model").disabled = $("load").disabled = true;
+  $("model").disabled = $("load").disabled = true; setBadge("busy", "loading model");
   try {
     await engine?.unload?.();
     engine = await webllm.CreateMLCEngine(id, {
@@ -239,13 +249,52 @@ $("load").onclick = async () => {
     });
     if (!mcpTools.length) await connectMcp();
     $("status").textContent = `${id} ready · ${mcpTools.length} MCP tools discovered`;
-    $("q").disabled = $("send").disabled = false; $("q").focus();
-  } catch (e) { $("status").textContent = "Error: " + e.message; }
+    setBadge("done", "ready"); $("q").disabled = $("send").disabled = false; $("q").focus();
+  } catch (e) { $("status").textContent = "Error: " + e.message; setBadge("fail", "load failed"); }
   $("model").disabled = $("load").disabled = false;
 };
 
-const complete = async messages =>
-  (await engine.chat.completions.create({ messages, temperature: 0, max_tokens: 300 })).choices[0].message.content.trim();
+// Constrained decoding: the model can only emit valid JSON with a known tool name (or final_answer)
+const outputSchema = () => JSON.stringify({
+  type: "object",
+  properties: {
+    tool: { type: "string", enum: [...mcpTools.map(t => t.name), "final_answer"] },
+    arguments: { type: "object" },
+    answer: { type: "string" }
+  },
+  required: ["tool"]
+});
+
+async function complete(messages, live) {
+  const opts = { messages, temperature: 0, max_tokens: 400, stream: true };
+  let stream;
+  try { stream = await engine.chat.completions.create({ ...opts, response_format: { type: "json_object", schema: outputSchema() } }); }
+  catch (e) { console.warn("Constrained decoding unavailable, falling back:", e); stream = await engine.chat.completions.create(opts); }
+  let text = "", n = 0; const t0 = performance.now();
+  for await (const ch of stream) {
+    text += ch.choices[0]?.delta?.content ?? "";
+    live.out.textContent = text;
+    live.tps.textContent = ` · ${(++n / ((performance.now() - t0) / 1000)).toFixed(0)} tok/s`;
+    $("chat").scrollTop = 1e9;
+  }
+  return text.trim();
+}
+
+let timer;
+function setBadge(kind, text) { $("badge").className = "badge " + kind; $("badge").textContent = text; }
+function startTimer(label) {
+  const t0 = performance.now(); clearInterval(timer);
+  const tick = () => { $("badge").textContent = `${label()} · ${((performance.now() - t0) / 1000).toFixed(1)}s`; };
+  setBadge("busy", ""); tick(); timer = setInterval(tick, 200);
+  return () => { clearInterval(timer); return (performance.now() - t0) / 1000; };
+}
+function liveBubble(title) {
+  const el = document.createElement("div"); el.className = "msg live";
+  el.innerHTML = `<b><span class="t"></span><span class="tps"></span></b><span class="o"></span>`;
+  el.querySelector(".t").textContent = title;
+  $("chat").append(el); $("chat").scrollTop = 1e9;
+  return { el, out: el.querySelector(".o"), tps: el.querySelector(".tps") };
+}
 
 $("form").onsubmit = async ev => {
   ev.preventDefault();
@@ -255,29 +304,45 @@ $("form").onsubmit = async ev => {
   add("msg user", q);
 
   const messages = [{ role: "system", content: systemPrompt() }, { role: "user", content: q }];
-  let final = null, invalid = 0;
+  let final = null, invalid = 0, step = 0, phase = "starting";
+  const stop = startTimer(() => phase);
   try {
-    for (let step = 0; step < 6 && final === null; step++) {
-      const text = await complete(messages);
-      const call = parseCall(text);
+    while (final === null && step < 6) {
+      step++; phase = `step ${step} · model thinking`;
+      const live = liveBubble(`Step ${step} · model is deciding what to do…`);
+      const text = await complete(messages, live);
+      live.el.remove();
       messages.push({ role: "assistant", content: text });
-      if (!call) { final = text; break; }
 
+      const call = parseCall(text);
+      if (!call && !text.includes("{")) { final = text; break; }          // plain-text fallback
+      if (!call) {
+        add("chip err", "model output was not valid JSON, retrying");
+        if (++invalid > 2) break;
+        messages.push({ role: "user", content: "Your reply was not valid JSON. Reply with ONLY one JSON object." });
+        continue;
+      }
+      if (call.tool === "final_answer") { final = call.answer ?? ""; break; }
+
+      call.name = call.tool; call.arguments = call.arguments ?? {};
       const problem = validate(call);
       if (problem) {
         add("chip err", `invalid call: ${problem}`);
-        if (++invalid > 2) { final = "I couldn't work out how to answer that with the available tools."; break; }
-        messages.push({ role: "user", content: `That call was invalid: ${problem} Try again with a valid JSON tool call.` });
+        if (++invalid > 2) break;
+        messages.push({ role: "user", content: `That call was invalid: ${problem} Try again.` });
         continue;
       }
-      add("chip", `${call.name}(${JSON.stringify(call.arguments)})`);
+      phase = `step ${step} · calling ${call.name}`;
+      add("chip", `🔧 ${call.name}(${JSON.stringify(call.arguments)})`);
       const res = await client.callTool({ name: call.name, arguments: call.arguments });
       const out = res.content.map(c => c.text).join("\n");
       try { const p = JSON.parse(out); renderTable([].concat(p).map(r => r?.id).filter(Boolean)); } catch {}
-      messages.push({ role: "user", content: `Tool result (${call.name}):\n${out}\n\nIf you now have enough information, answer in plain language. Otherwise call another tool.` });
+      messages.push({ role: "user", content: `Tool result (${call.name}):\n${out}\n\nIf you now have enough information, reply with final_answer. Otherwise call another tool.` });
     }
-    add("msg bot", final ?? "I reached the step limit without a final answer.");
-  } catch (e) { add("msg bot", "Error: " + e.message); }
+    const secs = stop();
+    if (final) { add("msg bot", final); add("meta", `done · ${step} step${step > 1 ? "s" : ""} · ${secs.toFixed(1)}s`); setBadge("done", `done · ${secs.toFixed(1)}s`); }
+    else { add("msg bot", "I couldn't reach an answer. Try rephrasing, or pick a larger model."); setBadge("fail", "no answer"); }
+  } catch (e) { stop(); add("chip err", "Error: " + e.message); setBadge("fail", "error"); console.error(e); }
   $("q").disabled = $("send").disabled = false; $("q").focus();
 };
 
