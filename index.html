@@ -1,330 +1,287 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" href="data:,">
-    <title>MCP + LLM 100% in Browser</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; line-height: 1.6; background: #fafafa; color: #333; }
-        button { padding: 10px 15px; border: none; border-radius: 5px; background: #0070f3; color: white; cursor: pointer; font-weight: bold; transition: background 0.2s; }
-        button:hover { background: #0051ba; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
-        input[type="text"] { width: 70%; padding: 10px; border: 1px solid #ccc; border-radius: 5px; margin-right: 10px; }
-        .box { background: #fff; padding: 15px; border-radius: 5px; min-height: 50px; border-left: 5px solid #0070f3; margin-top: 10px; white-space: pre-wrap; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        #trace { border-left-color: #8a2be2; font-family: ui-monospace, Consolas, monospace; font-size: 12px; max-height: 300px; overflow: auto; }
-        #status { font-weight: bold; color: #d4af37; }
-    </style>
-
-    <script type="module">
-        let engine = null;
-
-        const modelCandidates = [
-            "Qwen2.5-3B-Instruct-q4f32_1-MLC",
-            "Qwen2.5-3B-Instruct-q4f16_1-MLC",
-            "Qwen2.5-1.5B-Instruct-q4f32_1-MLC",
-            "Qwen2.5-1.5B-Instruct-q4f16_1-MLC"
-        ];
-
-        // ---------------------------------------------------------------
-        // Simulated MCP SERVER: speaks JSON-RPC 2.0 like a real one
-        // (initialize, tools/list, tools/call). Swap handle() for fetch()
-        // to a real remote MCP server later.
-        // ---------------------------------------------------------------
-        const USERS = [
-            { id: 1, name: "Alice", age: 25 },
-            { id: 2, name: "Bob", age: 34 },
-            { id: 3, name: "Charlie", age: 22 },
-            { id: 4, name: "David", age: 45 },
-            { id: 5, name: "Emma", age: 29 }
-        ];
-
-        const mcpServer = {
-            info: { name: "static-mcp-llm", version: "1.0.0" },
-            tools: [
-                {
-                    name: "list_users",
-                    description: "Returns all users with id, name and age.",
-                    inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => USERS
-                },
-                {
-                    name: "get_user",
-                    description: "Returns ONE user (id, name, age) looked up by name. Use only when the question names a specific person.",
-                    inputSchema: {
-                        type: "object",
-                        properties: { name: { type: "string", description: "User name, e.g. Alice" } },
-                        required: ["name"]
-                    },
-                    run: async ({ name }) =>
-                        USERS.find(u => u.name.toLowerCase() === String(name).toLowerCase()) || { error: "User not found" }
-                },
-                {
-                    name: "get_youngest_user",
-                    description: "Returns the single youngest user (id, name, age).",
-                    inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => USERS.reduce((a, b) => (b.age < a.age ? b : a))
-                },
-                {
-                    name: "get_oldest_user",
-                    description: "Returns the single oldest user (id, name, age).",
-                    inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => USERS.reduce((a, b) => (b.age > a.age ? b : a))
-                },
-                {
-                    name: "get_average_age",
-                    description: "Returns the average age of all users.",
-                    inputSchema: { type: "object", properties: {}, required: [] },
-                    run: async () => ({ average_age: USERS.reduce((sum, u) => sum + u.age, 0) / USERS.length })
-                }
-            ],
-            async handle({ id, method, params }) {
-                if (method === "initialize") {
-                    return { jsonrpc: "2.0", id, result: { serverInfo: this.info, capabilities: { tools: {} } } };
-                }
-                if (method === "tools/list") {
-                    const tools = this.tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
-                    return { jsonrpc: "2.0", id, result: { tools } };
-                }
-                if (method === "tools/call") {
-                    const tool = this.tools.find(t => t.name === params.name);
-                    if (!tool) return { jsonrpc: "2.0", id, error: { code: -32602, message: "Unknown tool: " + params.name } };
-                    try {
-                        const data = await tool.run(params.arguments || {});
-                        return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(data) }], isError: false } };
-                    } catch (e) {
-                        return { jsonrpc: "2.0", id, result: { content: [{ type: "text", text: String(e) }], isError: true } };
-                    }
-                }
-                return { jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } };
-            }
-        };
-
-        // ---------------------------------------------------------------
-        // MCP CLIENT: sends requests to the server and logs the traffic
-        // ---------------------------------------------------------------
-        let rpcId = 0;
-        let mcpTools = [];
-        const traceEl = () => document.getElementById("trace");
-
-        function trace(label, obj) {
-            const el = traceEl();
-            el.textContent += `${label} ${typeof obj === "string" ? obj : JSON.stringify(obj)}\n`;
-            el.scrollTop = el.scrollHeight;
-        }
-
-        const mcpClient = {
-            async request(method, params) {
-                const req = { jsonrpc: "2.0", id: ++rpcId, method, params };
-                trace("→ MCP", req);
-                const res = await mcpServer.handle(req);
-                trace("← MCP", res);
-                return res;
-            }
-        };
-
-        // ---------------------------------------------------------------
-        // HOST: tells the model which tools exist (definitions only, no data)
-        // ---------------------------------------------------------------
-        function buildSystemPrompt() {
-            const toolDocs = mcpTools.map(t =>
-                `- ${t.name}: ${t.description} Arguments schema: ${JSON.stringify(t.inputSchema.properties)}`
-            ).join("\n");
-
-            return (
-                "You decide which tool to use for questions about a user database. You have NO user data yourself.\n\n" +
-                "Available tools:\n" + toolDocs + "\n" +
-                "- none: use when the question is NOT about the users (greetings, coding, general knowledge).\n\n" +
-                "Reply with ONLY one JSON object and no other text. Format: {\"tool\": \"<name>\", \"arguments\": {...}}\n\n" +
-                "Examples:\n" +
-                "Question: list all users\n{\"tool\": \"list_users\", \"arguments\": {}}\n" +
-                "Question: who is the youngest user?\n{\"tool\": \"get_youngest_user\", \"arguments\": {}}\n" +
-                "Question: what is the average age?\n{\"tool\": \"get_average_age\", \"arguments\": {}}\n" +
-                "Question: who is the oldest user?\n{\"tool\": \"get_oldest_user\", \"arguments\": {}}\n" +
-                "Question: how old is Bob?\n{\"tool\": \"get_user\", \"arguments\": {\"name\": \"Bob\"}}\n" +
-                "Question: hello\n{\"tool\": \"none\", \"arguments\": {}}\n" +
-                "Question: write me a poem\n{\"tool\": \"none\", \"arguments\": {}}"
-            );
-        }
-
-        function parseToolCall(text) {
-            const match = text.match(/\{[\s\S]*\}/);
-            if (!match) return null;
-            try {
-                const obj = JSON.parse(match[0]);
-                if (obj && obj.tool === "none") return { none: true };
-                if (obj && typeof obj.tool === "string" && mcpTools.some(t => t.name === obj.tool)) {
-                    return { name: obj.tool, arguments: obj.arguments || {} };
-                }
-            } catch (_) { /* invalid JSON */ }
-            return null;
-        }
-
-        function validateArgs(call) {
-            const tool = mcpTools.find(t => t.name === call.name);
-            const props = tool.inputSchema.properties || {};
-            for (const key of tool.inputSchema.required || []) {
-                const v = call.arguments[key];
-                const type = props[key] && props[key].type;
-                if (v === null || v === undefined || v === "" || (type === "string" && typeof v !== "string")) {
-                    return `Argument "${key}" is required and must be a ${type || "value"}.`;
-                }
-            }
-            return null;
-        }
-
-        // ---------------------------------------------------------------
-        window.initLLM = async function () {
-            const statusEl = document.getElementById("status");
-            const loadBtn = document.getElementById("load-btn");
-
-            if (!navigator.gpu) {
-                statusEl.innerText = "WebGPU is not available in this browser. In Brave, enable brave://flags/#enable-unsafe-webgpu and restart.";
-                statusEl.style.color = "red";
-                return;
-            }
-
-            loadBtn.disabled = true;
-            statusEl.innerText = "Connecting to CDN and loading library...";
-            statusEl.style.color = "#d4af37";
-
-            let webllm;
-            try {
-                webllm = await import("https://esm.run/@mlc-ai/web-llm");
-            } catch (error) {
-                console.error(error);
-                statusEl.innerText = "Network Error: Could not fetch the WebLLM library from the CDN.";
-                statusEl.style.color = "red";
-                loadBtn.disabled = false;
-                return;
-            }
-
-            try {
-                const available = webllm.prebuiltAppConfig.model_list.map(m => m.model_id);
-                const modelId = modelCandidates.find(id => available.includes(id));
-                if (!modelId) throw new Error("None of the configured models exist in this WebLLM version. See console.");
-                console.log("Available models:", available);
-
-                statusEl.innerText = `Downloading model ${modelId}...`;
-                engine = await webllm.CreateMLCEngine(modelId, {
-                    initProgressCallback: (report) => { statusEl.innerText = report.text; }
-                });
-
-                // MCP handshake + tool discovery
-                await mcpClient.request("initialize", { clientInfo: { name: "browser-host", version: "1.0.0" } });
-                const listed = await mcpClient.request("tools/list", {});
-                mcpTools = listed.result.tools;
-
-                statusEl.innerText = `Model ${modelId} ready. ${mcpTools.length} MCP tools discovered.`;
-                statusEl.style.color = "green";
-                document.getElementById("chat-btn").disabled = false;
-            } catch (error) {
-                console.error(error);
-                statusEl.innerText = "Model error: " + error.message;
-                statusEl.style.color = "red";
-                loadBtn.disabled = false;
-            }
-        };
-
-        window.sendPrompt = async function () {
-            const inputEl = document.getElementById("user-input");
-            const chatBtn = document.getElementById("chat-btn");
-            const responseEl = document.getElementById("resposta");
-            const question = inputEl.value.trim();
-            if (!question || !engine) return;
-
-            chatBtn.disabled = true;
-            responseEl.innerText = "The local model is thinking...";
-            trace("\n=== QUESTION ===", question);
-
-            try {
-                // Phase 1: the model only decides which tool to call (or "none"); invalid calls get one retry
-                const decideMessages = [
-                    { role: "system", content: buildSystemPrompt() },
-                    { role: "user", content: "Question: " + question }
-                ];
-                let call = null;
-                for (let attempt = 0; attempt < 2; attempt++) {
-                    const decision = await engine.chat.completions.create({
-                        messages: decideMessages, temperature: 0, max_tokens: 80
-                    });
-                    const decisionText = decision.choices[0].message.content.trim();
-                    trace(attempt ? "LLM (decide, retry)" : "LLM (decide)", decisionText);
-
-                    call = parseToolCall(decisionText);
-                    const problem = !call
-                        ? "The reply was not a valid JSON tool call."
-                        : (call.none ? null : validateArgs(call));
-                    if (!problem) break;
-
-                    trace("HOST validation", problem);
-                    decideMessages.push({ role: "assistant", content: decisionText });
-                    decideMessages.push({
-                        role: "user",
-                        content: `That call was invalid: ${problem} Reply again with ONLY the JSON object. Re-read the tool descriptions and pick the tool that matches the question.`
-                    });
-                    call = null;
-                }
-
-                let finalAnswer;
-                if (!call) {
-                    finalAnswer = "I couldn't map that question to a tool. Try rephrasing it.";
-                } else if (call.none) {
-                    finalAnswer = "I can only assist with user database queries.";
-                } else {
-                    // Execute the tool through the MCP client
-                    const res = await mcpClient.request("tools/call", { name: call.name, arguments: call.arguments });
-                    const out = res.error
-                        ? "Error: " + res.error.message
-                        : res.result.content.map(c => c.text).join("\n");
-
-                    // Phase 2: fresh prompt with only the question and the tool result
-                    const answer = await engine.chat.completions.create({
-                        messages: [
-                            { role: "system", content: "You answer questions using ONLY the tool result provided. Be short and direct, in plain language. Do not output JSON and do not mention tools." },
-                            { role: "user", content: `Question: ${question}\n\nTool result:\n${out}` }
-                        ],
-                        temperature: 0,
-                        max_tokens: 150
-                    });
-                    finalAnswer = answer.choices[0].message.content.trim();
-                    trace("LLM (answer)", finalAnswer);
-                }
-
-                responseEl.innerText = finalAnswer;
-            } catch (error) {
-                console.error(error);
-                responseEl.innerText = "An error occurred while processing the AI response: " + error.message;
-            } finally {
-                chatBtn.disabled = false;
-            }
-        };
-
-        document.getElementById("user-input").addEventListener("keydown", (e) => {
-            if (e.key === "Enter") window.sendPrompt();
-        });
-    </script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" href="data:,">
+<title>MCP + LLM, 100% in your browser</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0b0f14;--panel:#121820;--line:#222c38;--txt:#dbe4ee;--dim:#7d8ea1;--acc:#5eead4;--acc2:#a78bfa;--warn:#fbbf24;--bad:#f87171;--ok:#4ade80;
+--sans:"Space Grotesk",system-ui,sans-serif;--mono:"JetBrains Mono",ui-monospace,Consolas,monospace}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--txt);font:15px/1.5 var(--sans);display:flex;flex-direction:column;padding:16px 20px;gap:12px}
+header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
+h1{font-size:20px;margin:0;letter-spacing:-.02em}
+h1 span{color:var(--acc)}
+.pill{font:12px var(--mono);color:var(--dim);border:1px solid var(--line);border-radius:99px;padding:2px 10px}
+.loader{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+select,input,button{font:inherit;color:var(--txt);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+select{max-width:340px}
+button{background:var(--acc);color:#04211d;border:0;font-weight:700;cursor:pointer}
+button:hover{filter:brightness(1.1)}button:disabled,select:disabled{opacity:.4;cursor:not-allowed}
+#bar{height:3px;background:var(--line);border-radius:3px;overflow:hidden}
+#bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+#status{font:12px var(--mono);color:var(--dim);min-height:18px}
+main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:14px}
+@media(max-width:900px){main{grid-template-columns:1fr}body{height:auto}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.card>h2{margin:0;padding:10px 14px;font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.1em;color:var(--dim);border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+.side{display:grid;grid-template-rows:auto minmax(0,1fr);gap:14px;min-height:0}
+#chat{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:88%;padding:9px 13px;border-radius:12px;white-space:pre-wrap}
+.user{align-self:flex-end;background:#1d3b3a;border:1px solid #2b5654}
+.bot{align-self:flex-start;background:#171f2a;border:1px solid var(--line)}
+.sys{align-self:center;color:var(--dim);font:12px var(--mono)}
+.chip{align-self:flex-start;font:12px var(--mono);color:var(--acc2);background:#1b1830;border:1px solid #33295c;border-radius:8px;padding:3px 10px}
+.chip.err{color:var(--bad);border-color:#5c2929;background:#2a1414}
+form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--line)}
+form input{flex:1}
+table{width:100%;border-collapse:collapse;font:13px var(--mono)}
+th,td{text-align:left;padding:7px 14px;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:400}
+tr.hit td{animation:hit 1.6s ease-out}
+@keyframes hit{0%,30%{background:#134e4a}100%{background:transparent}}
+#trace{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px}
+details{border:1px solid var(--line);border-radius:8px;background:#0e141b}
+summary{cursor:pointer;padding:6px 10px;font:12px var(--mono);list-style:none}
+summary::-webkit-details-marker{display:none}
+.out{color:var(--warn)}.in{color:var(--ok)}
+pre{margin:0;padding:8px 12px 10px;font:12px/1.5 var(--mono);overflow:auto;border-top:1px solid var(--line)}
+.k{color:#7dd3fc}.s{color:#fca5a5}.n{color:var(--warn)}.b{color:var(--acc2)}
+</style>
 </head>
 <body>
+<header>
+  <div><h1>MCP <span>+</span> LLM <span class="pill">100% in the browser</span></h1></div>
+  <div class="loader">
+    <select id="model" disabled><option>Loading model list…</option></select>
+    <button id="load" disabled>Load model</button>
+  </div>
+</header>
+<div><div id="bar"><i></i></div><div id="status">WebGPU required. Pick a model and load it.</div></div>
 
-    <h1>MCP + LLM 100% in Browser</h1>
+<main>
+  <section class="card">
+    <h2><span>Chat</span><span id="tools-count"></span></h2>
+    <div id="chat"><div class="msg sys">Load a model, then ask about the data on the right.</div></div>
+    <form id="form"><input id="q" placeholder="e.g. What year was the oldest person born?" autocomplete="off" disabled><button id="send" disabled>Send</button></form>
+  </section>
+  <div class="side">
+    <section class="card">
+      <h2><span>Users (MCP server data)</span><span id="count"></span></h2>
+      <table><thead><tr><th>ID</th><th>Name</th><th>Age</th></tr></thead><tbody id="rows"></tbody></table>
+    </section>
+    <section class="card">
+      <h2><span>MCP traffic (JSON-RPC)</span><span>click to expand</span></h2>
+      <div id="trace"></div>
+    </section>
+  </div>
+</main>
 
-    <p>Current Status: <span id="status">Waiting for user command...</span></p>
+<script type="module">
+// Official MCP SDK, pinned. `deps` makes every package share the same zod copy.
+const SDK = "https://esm.sh/@modelcontextprotocol/sdk@1.31.0";
+const Z = "?deps=zod@3.25.76";
+const [{ McpServer }, { Client }, { InMemoryTransport }, { z }] = await Promise.all([
+  import(`${SDK}/server/mcp.js${Z}`),
+  import(`${SDK}/client/index.js${Z}`),
+  import(`${SDK}/inMemory.js${Z}`),
+  import("https://esm.sh/zod@3.25.76")
+]);
 
-    <button id="load-btn" onclick="window.initLLM()">Load Local Model (Requires WebGPU)</button>
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-    <hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;">
+// ------------------------------------------------------------------
+// 1. MCP SERVER: built with the SDK. Adding a capability = registerTool().
+// ------------------------------------------------------------------
+const USERS = [
+  { id: 1, name: "Alice", age: 25 }, { id: 2, name: "Bob", age: 34 },
+  { id: 3, name: "Charlie", age: 22 }, { id: 4, name: "David", age: 45 },
+  { id: 5, name: "Emma", age: 29 }
+];
+const reply = data => ({ content: [{ type: "text", text: JSON.stringify(data) }] });
 
-    <div>
-        <input type="text" id="user-input" placeholder="e.g., How old is Alice? / Who is the youngest user? / Average age?">
-        <button id="chat-btn" onclick="window.sendPrompt()" disabled>Send</button>
-    </div>
+const server = new McpServer({ name: "users-demo", version: "1.0.0" });
 
-    <h3>Model Response:</h3>
-    <div id="resposta" class="box">The output will appear here after loading the model and submitting a prompt.</div>
+server.registerTool("list_users",
+  { description: "Return all users (id, name, age)." },
+  async () => reply(USERS));
 
-    <h3>MCP Trace:</h3>
-    <div id="trace" class="box"></div>
+server.registerTool("get_user",
+  { description: "Return one user looked up by name.", inputSchema: { name: z.string().describe("User name, e.g. Alice") } },
+  async ({ name }) => reply(USERS.find(u => u.name.toLowerCase() === name.toLowerCase()) ?? { error: "User not found" }));
 
+server.registerTool("add_user",
+  { description: "Add a new user.", inputSchema: { name: z.string(), age: z.number().describe("Age in years") } },
+  async ({ name, age }) => { const u = { id: USERS.length + 1, name, age }; USERS.push(u); renderTable([u.id]); return reply(u); });
+
+server.registerTool("calculate",
+  { description: "Evaluate an arithmetic expression exactly. Use it for any math.", inputSchema: { expression: z.string().describe("e.g. (25+34)/2 or 2026-45") } },
+  async ({ expression }) => {
+    if (!/^[\d+\-*/().%\s]+$/.test(expression)) return reply({ error: "Only numbers and + - * / % ( ) are allowed" });
+    return reply({ result: Function(`"use strict";return (${expression})`)() });
+  });
+
+// ------------------------------------------------------------------
+// 2. MCP CLIENT: official Client over an in-memory transport.
+//    Swap the transport for StreamableHTTPClientTransport to use a real remote server.
+// ------------------------------------------------------------------
+const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+const client = new Client({ name: "browser-host", version: "1.0.0" });
+let mcpTools = [];
+
+// Show a message with JSON-in-text expanded so it is readable
+function pretty(msg) {
+  const m = structuredClone(msg);
+  for (const c of m.result?.content ?? [])
+    if (c.type === "text") try { c.text = JSON.parse(c.text); } catch {}
+  return JSON.stringify(m, null, 2);
+}
+const highlight = s => esc(s).replace(/("(?:\\.|[^"\\])*")(\s*:)?|\b(-?\d+\.?\d*)\b|\b(true|false|null)\b/g,
+  (m, str, colon, num, kw) => str ? (colon ? `<span class="k">${str}</span>${colon}` : `<span class="s">${str}</span>`)
+    : num ? `<span class="n">${num}</span>` : `<span class="b">${kw}</span>`);
+
+function trace(dir, msg) {
+  const label = msg.method ?? (msg.error ? "error" : "result");
+  const d = document.createElement("details");
+  d.innerHTML = `<summary><span class="${dir === "→" ? "out" : "in"}">${dir}</span> ${esc(label)}${msg.params?.name ? " · " + esc(msg.params.name) : ""}</summary><pre>${highlight(pretty(msg))}</pre>`;
+  $("trace").append(d);
+  $("trace").scrollTop = 1e9;
+}
+
+async function connectMcp() {
+  await server.connect(serverT);
+  await client.connect(clientT);
+  // Observe the wire without changing behaviour
+  const send = clientT.send.bind(clientT);
+  clientT.send = (m, o) => { trace("→", m); return send(m, o); };
+  const onmsg = clientT.onmessage;
+  clientT.onmessage = (m, e) => { trace("←", m); onmsg?.(m, e); };
+  mcpTools = (await client.listTools()).tools;
+  $("tools-count").textContent = `${mcpTools.length} tools`;
+}
+
+// ------------------------------------------------------------------
+// 3. HOST: generic prompt built only from what the server advertises.
+// ------------------------------------------------------------------
+function systemPrompt() {
+  const docs = mcpTools.map(t => `- ${t.name}: ${t.description ?? ""} Arguments: ${JSON.stringify(t.inputSchema.properties ?? {})}`).join("\n");
+  return `You are a helpful assistant running locally in a browser. You have no data of your own: use tools to look up facts and to do calculations. Never do arithmetic yourself if a calculator tool exists.
+Today's date: ${new Date().toDateString()}.
+
+Tools:
+${docs}
+
+To call a tool, reply with ONLY a JSON object: {"tool": "<tool name>", "arguments": {...}}
+You can call tools one after another. Once you have what you need, reply with a short plain-language answer (no JSON). If no tool is relevant, just answer normally.`;
+}
+
+function parseCall(text) {
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { const o = JSON.parse(m[0]); return typeof o.tool === "string" ? { name: o.tool, arguments: o.arguments ?? {} } : null; } catch { return null; }
+}
+
+function validate(call) {
+  const tool = mcpTools.find(t => t.name === call.name);
+  if (!tool) return `Unknown tool "${call.name}". Available: ${mcpTools.map(t => t.name).join(", ")}.`;
+  for (const key of tool.inputSchema.required ?? []) {
+    const type = tool.inputSchema.properties?.[key]?.type;
+    const v = call.arguments[key];
+    if (v == null || v === "" || (type && typeof v !== type)) return `Argument "${key}" is required and must be of type ${type}.`;
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------
+// 4. UI
+// ------------------------------------------------------------------
+function renderTable(hit = []) {
+  $("rows").innerHTML = USERS.map(u => `<tr class="${hit.includes(u.id) ? "hit" : ""}"><td>${u.id}</td><td>${esc(u.name)}</td><td>${u.age}</td></tr>`).join("");
+  $("count").textContent = `${USERS.length} rows`;
+}
+renderTable();
+
+function add(cls, text) {
+  const el = document.createElement("div");
+  el.className = cls; el.textContent = text;
+  $("chat").append(el); $("chat").scrollTop = 1e9;
+  return el;
+}
+
+let engine, webllm;
+
+async function init() {
+  try {
+    webllm = await import("https://esm.run/@mlc-ai/web-llm");
+    const list = webllm.prebuiltAppConfig.model_list.filter(m => !m.model_type).sort((a, b) => a.vram_required_MB - b.vram_required_MB);
+    const cached = await Promise.all(list.map(m => webllm.hasModelInCache(m.model_id).catch(() => false)));
+    $("model").innerHTML = list.map((m, i) =>
+      `<option value="${m.model_id}">${m.model_id.replace("-MLC", "")} · ${(m.vram_required_MB / 1024).toFixed(1)} GB${cached[i] ? " · cached" : ""}</option>`).join("");
+    const pref = ["Qwen2.5-3B-Instruct-q4f32_1-MLC", "Qwen2.5-3B-Instruct-q4f16_1-MLC"].find(id => list.some(m => m.model_id === id));
+    if (pref) $("model").value = pref;
+    $("model").disabled = $("load").disabled = false;
+    $("status").textContent = navigator.gpu ? "Pick a model and load it." : "WebGPU is not available in this browser (Brave: enable brave://flags/#enable-unsafe-webgpu).";
+  } catch (e) { $("status").textContent = "Could not load WebLLM: " + e.message; }
+}
+
+$("load").onclick = async () => {
+  const id = $("model").value;
+  $("model").disabled = $("load").disabled = true;
+  try {
+    await engine?.unload?.();
+    engine = await webllm.CreateMLCEngine(id, {
+      initProgressCallback: r => { $("status").textContent = r.text; $("bar").firstElementChild.style.width = Math.round(r.progress * 100) + "%"; }
+    });
+    if (!mcpTools.length) await connectMcp();
+    $("status").textContent = `${id} ready · ${mcpTools.length} MCP tools discovered`;
+    $("q").disabled = $("send").disabled = false; $("q").focus();
+  } catch (e) { $("status").textContent = "Error: " + e.message; }
+  $("model").disabled = $("load").disabled = false;
+};
+
+const complete = async messages =>
+  (await engine.chat.completions.create({ messages, temperature: 0, max_tokens: 300 })).choices[0].message.content.trim();
+
+$("form").onsubmit = async ev => {
+  ev.preventDefault();
+  const q = $("q").value.trim();
+  if (!q || !engine) return;
+  $("q").value = ""; $("q").disabled = $("send").disabled = true;
+  add("msg user", q);
+
+  const messages = [{ role: "system", content: systemPrompt() }, { role: "user", content: q }];
+  let final = null, invalid = 0;
+  try {
+    for (let step = 0; step < 6 && final === null; step++) {
+      const text = await complete(messages);
+      const call = parseCall(text);
+      messages.push({ role: "assistant", content: text });
+      if (!call) { final = text; break; }
+
+      const problem = validate(call);
+      if (problem) {
+        add("chip err", `invalid call: ${problem}`);
+        if (++invalid > 2) { final = "I couldn't work out how to answer that with the available tools."; break; }
+        messages.push({ role: "user", content: `That call was invalid: ${problem} Try again with a valid JSON tool call.` });
+        continue;
+      }
+      add("chip", `${call.name}(${JSON.stringify(call.arguments)})`);
+      const res = await client.callTool({ name: call.name, arguments: call.arguments });
+      const out = res.content.map(c => c.text).join("\n");
+      try { const p = JSON.parse(out); renderTable([].concat(p).map(r => r?.id).filter(Boolean)); } catch {}
+      messages.push({ role: "user", content: `Tool result (${call.name}):\n${out}\n\nIf you now have enough information, answer in plain language. Otherwise call another tool.` });
+    }
+    add("msg bot", final ?? "I reached the step limit without a final answer.");
+  } catch (e) { add("msg bot", "Error: " + e.message); }
+  $("q").disabled = $("send").disabled = false; $("q").focus();
+};
+
+init();
+</script>
 </body>
 </html>
